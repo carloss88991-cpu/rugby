@@ -1608,27 +1608,34 @@ function makeDb(lid) {
 /* ---- sesión y perfil ---- */
 function sbInit() { SB = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true } }); }
 async function applyUser() {
-  const { data } = await SB.auth.getSession(); const u = data && data.session && data.session.user;
-  S.uid = u ? u.id : null; S.isAnon = !u || !!u.is_anonymous; S.email = (u && u.email) || ''; S.gname = (u && u.user_metadata && (u.user_metadata.full_name || u.user_metadata.name)) || '';
+  const { data } = await SB.auth.getSession(); let u = data && data.session && data.session.user; if (u && u.is_anonymous) u = null;
+  S.uid = u ? u.id : null; S.isAnon = false; S.email = (u && u.email) || ''; S.gname = (u && u.user_metadata && (u.user_metadata.full_name || u.user_metadata.name)) || '';
 }
 async function authInit() {
-  const { data } = await SB.auth.getSession();
-  if (!data.session) { const r = await SB.auth.signInAnonymously(); if (r.error) throw r.error; }
+  const { data } = await SB.auth.getSession(); const u = data && data.session && data.session.user;
+  if (u && u.is_anonymous) { try { await SB.auth.signOut(); } catch (e) { } }
   await applyUser();
 }
+const ERRS = { LIGA_LLENA: 'Esa liga está llena.', LIMITE_LIGAS: 'Has llegado al máximo de 8 ligas. Abandona alguna para unirte a otra.', EXPULSADO: 'Te han expulsado de esa liga.', LOGIN_REQUERIDO: 'Inicia sesión con Google para jugar online.', NO_MIEMBRO: 'Ya no eres miembro de esa liga.', NO_ADMIN: 'Solo el comisionado puede hacer eso.' };
+function errMsg(e) { const m = String((e && (e.message || e.code)) || e || ''); for (const k in ERRS) if (m.includes(k)) return ERRS[k]; return m; }
+async function refreshMyLeagues() { try { const { data, error } = await SB.rpc('my_leagues'); if (!error && Array.isArray(data)) S.myLeagues = data; } catch (e) { } }
 async function loadProfile() {
-  let x = {}; try { const { data } = await SB.from('profiles').select('name,leagues').eq('uid', S.uid).maybeSingle(); if (data) x = data; } catch (e) { }
+  let x = {}; try { const { data } = await SB.from('profiles').select('name').eq('uid', S.uid).maybeSingle(); if (data) x = data; } catch (e) { }
   let ln = ''; try { ln = localStorage.getItem('gd.name') || ''; } catch (e) { }
-  S.myName = x.name || ln || S.gname || ''; S.myLeagues = Array.isArray(x.leagues) ? x.leagues : [];
+  S.myName = x.name || ln || S.gname || ''; await refreshMyLeagues();
 }
-function saveProfile() { if (!S.uid) return; try { localStorage.setItem('gd.name', S.myName || ''); } catch (e) { } SB.from('profiles').upsert({ uid: S.uid, name: S.myName || '', leagues: S.myLeagues || [] }).then(() => { }, () => { }); }
+function saveProfile() { if (!S.uid) return; try { localStorage.setItem('gd.name', S.myName || ''); } catch (e) { } SB.from('profiles').upsert({ uid: S.uid, name: S.myName || '' }).then(() => { }, () => { }); }
 const displayName = () => (S.myName && S.myName.trim()) || ('Mánager ' + String(S.uid || '').slice(0, 4));
 function rememberLeague(lid, name) {
-  S.myLeagues = (S.myLeagues || []).filter(l => l.id !== lid); S.myLeagues.unshift({ id: lid, name: name || lid }); S.myLeagues = S.myLeagues.slice(0, 12);
-  try { localStorage.setItem('gd.lastLeague', lid); } catch (e) { } saveProfile();
+  try { localStorage.setItem('gd.lastLeague', lid); } catch (e) { } saveProfile(); refreshMyLeagues();
 }
 function saveName(v) { S.myName = String(v || '').trim().slice(0, 24); saveProfile(); touchMember(); S.names[S.uid] = displayName(); toast('Nombre guardado.'); }
-function touchMember() { if (!S.db || !S.uid) return; S.names[S.uid] = displayName(); SB.from('members').update({ name: displayName(), seen: Date.now() }).eq('league', S.lid).eq('uid', S.uid).then(() => { }, () => { }); }
+function touchMember() {
+  if (!S.db || !S.uid) return; S.names[S.uid] = displayName();
+  SB.rpc('touch_member', { p_league: S.lid, p_name: displayName() }).then(({ error }) => {
+    if (error && /NO_MIEMBRO/.test(error.message || '')) { toast('Ya no eres miembro de esa liga.', 1); disconnect(); try { localStorage.removeItem('gd.lastLeague'); } catch (e) { } S.menu = true; refreshMyLeagues().then(render); }
+  }, () => { });
+}
 function newCode() { const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; let c = ''; for (let i = 0; i < 6; i++) c += A[Math.floor(Math.random() * A.length)]; return c; }
 function urlLeague() { try { const q = new URLSearchParams(location.search).get('liga'); if (q) return q; const m = /liga=([A-Za-z0-9]+)/.exec(location.hash); return m ? m[1] : ''; } catch (e) { return ''; } }
 const inviteLink = () => location.href.split(/[?#]/)[0] + '?liga=' + (S.lid || '');
@@ -1641,11 +1648,12 @@ function disconnect() {
 }
 async function connectLeague(lid, quiet) {
   lid = String(lid || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, ''); if (!lid || !SB) return false;
-  let name; try { const { data, error } = await SB.rpc('join_league', { p_id: lid, p_player: displayName() }); if (error) throw error; name = data; } catch (e) { if (!quiet) toast('No se pudo abrir la liga: ' + (e.message || e.code), 1); return false; }
+  let name; try { const { data, error } = await SB.rpc('join_league', { p_id: lid, p_player: displayName() }); if (error) throw error; name = data; } catch (e) { if (!quiet) toast('No se pudo abrir la liga: ' + errMsg(e), 1); return false; }
   if (!name) { if (!quiet) toast('No existe ninguna liga con el código ' + lid + '.', 1); try { if (localStorage.getItem('gd.lastLeague') === lid) localStorage.removeItem('gd.lastLeague'); } catch (e) { } return false; }
   disconnect(); S.lid = lid; S.db = makeDb(lid); S.room = true; S.sync = 'conectando';
   olStart(); chatStart(); membersStart(); touchMember();
   OL.hb = setInterval(() => { if (!document.hidden) touchMember(); }, 120000);
+  setTimeout(reapInactive, 7000);
   rememberLeague(lid, name);
   try { history.replaceState(null, '', location.href.split(/[?#]/)[0] + '?liga=' + lid); } catch (e) { }
   render(); return true;
@@ -1712,21 +1720,21 @@ function olRebuild() {
   S.prevMeta = { week: m.week, phase: m.phase, season: m.season, round: m.round };
   render();
 }
-async function createOnline(W, tid) {
+async function createOnline(W, tid, pub) {
   S.busy = true; render();
   try {
-    let tz = 'Europe/Madrid'; try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || tz; } catch (e) { }
-    const pt = String(S.ltime || '20:00').split(':').map(Number); const hm = [isFinite(pt[0]) ? pt[0] : 20, isFinite(pt[1]) ? pt[1] : 0];
+    let tz = 'Europe/Madrid'; if (!pub) { try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || tz; } catch (e) { } }
+    const pt = String(pub ? '20:00' : (S.ltime || '20:00')).split(':').map(Number); const hm = [isFinite(pt[0]) ? pt[0] : 20, isFinite(pt[1]) ? pt[1] : 0];
     W.meta.tz = tz; W.meta.hm = hm; W.meta.auto = true; W.meta.nextAt = nextSlot(Date.now(), tz, hm);
-    let lid = ''; for (let k = 0; k < 6 && !lid; k++) { const cd = newCode(); const { data, error } = await SB.rpc('create_league', { p_id: cd, p_name: W.meta.name, p_player: displayName() }); if (!error && data) lid = cd; else if (error && error.code !== '23505') throw error; }
+    let lid = ''; for (let k = 0; k < 6 && !lid; k++) { const cd = newCode(); const { data, error } = await SB.rpc('create_league', { p_id: cd, p_name: W.meta.name, p_player: displayName(), p_public: !!pub }); if (!error && data) lid = cd; else if (error && error.code !== '23505') throw error; }
     if (!lid) throw new Error('No se pudo generar un código de liga');
     disconnect(); S.db = makeDb(lid); S.lid = lid;
     await putAll([['core', coreDoc(W)], ['own', { o: { [tid]: S.uid }, adm: S.uid }], ['fa', { fa: W.fa }], ['dr', { draft: W.draft }]].concat(Array.from({ length: 32 }, (_, t) => ['r' + t, rosterDoc(W, t)])));
     const ok = await connectLeague(lid); if (!ok) throw new Error('No se pudo conectar con la liga recién creada');
     await waitCache(8000);
     S.mode = 'online'; S.pick = null; S.view = 'home'; S.prevMeta = null; S.menu = false;
-    toast('Liga creada. Código: ' + lid + ' · Comparte el enlace desde la pestaña Online.');
-  } catch (e) { toast('No se pudo crear la liga: ' + (e.message || e.code), 1); }
+    toast(pub ? 'Liga pública abierta. Otros mánagers entrarán con «Jugar online».' : 'Liga creada. Código: ' + lid + ' · Comparte el enlace desde la pestaña Online.');
+  } catch (e) { toast('No se pudo crear la liga: ' + errMsg(e), 1); }
   S.busy = false; olRebuild();
 }
 async function claimTeam(tid) {
@@ -1744,6 +1752,23 @@ async function claimTeam(tid) {
 }
 async function releaseTeam() {
   try { const x = JSON.parse(OL.cache.own ? JSON.stringify(OL.cache.own) : '{"o":{}}'); for (const k in x.o) if (x.o[k] === S.uid) delete x.o[k]; await put('own', x); toast('Has dejado el equipo.'); } catch (e) { toast('No se pudo dejar el equipo.', 1); }
+}
+async function removeOwners(uids) {
+  const ref = S.db.doc('lg/own'); const a = await ref.acquire({ holder: S.uid, ttlMs: 4000 });
+  if (!a.acquired) throw new Error('Otro jugador está cambiando equipos. Inténtalo de nuevo.');
+  const s0 = await ref.get(); const x = s0.exists && s0.data() && s0.data().j ? JSON.parse(s0.data().j) : { o: {}, adm: S.uid };
+  let ch = false; for (const k in x.o) if (uids.includes(x.o[k])) { delete x.o[k]; ch = true; }
+  if (x.adm && uids.includes(x.adm)) { x.adm = S.uid; ch = true; }
+  if (ch) await put('own', x);
+  ref.release();
+}
+/* mánagers sin conectarse en 14 días: su equipo vuelve a la IA y se libera su plaza */
+async function reapInactive() {
+  if (!S.db || !S.uid || OL.reaped === S.lid) return; OL.reaped = S.lid;
+  const cutoff = Date.now() - 14 * 864e5;
+  const stale = Object.values(OL.members).filter(m => m && m.uid && m.uid !== S.uid && (Number(m.seen) || 0) < cutoff).map(m => m.uid);
+  if (!stale.length) return;
+  try { await removeOwners(stale); for (const u of stale) await SB.rpc('drop_member', { p_league: S.lid, p_uid: u }); } catch (e) { }
 }
 async function enterLeague() { S.mode = 'online'; S.pick = null; S.prevMeta = null; olRebuild(); }
 
@@ -2026,13 +2051,13 @@ function vHistory() {
 function vOnline() {
   const W = S.W, m = W.meta; const rows = W.teams.filter(t => t.id in S.owners);
   const online = new Set(S.peers.map(p => p.by).filter(Boolean));
-  const auto = m.auto !== false; const adm = isAdm();
+  const auto = m.auto !== false; const adm = isAdm(); const cur = (S.myLeagues || []).find(l => l.id === S.lid);
   const cal = auto && m.nextAt ? `Próximo avance: <b data-nm="${m.nextAt}">${esc(nextWhen(m.nextAt))}</b>.` : 'El avance automático está desactivado: el comisionado avanza a mano.';
   return `${ph('Online')}<div class="grid g2"><section class="card"><h3>${esc(m.name)}</h3>
   <p class="sm">Código de la liga: <b>${esc(S.lid || '')}</b> <button class="btn sm" data-a="copylink">Copiar enlace de invitación</button></p>
-  <p>${rows.length} mánager${rows.length === 1 ? '' : 'es'} humano${rows.length === 1 ? '' : 's'} · ${S.peers.length} conectado${S.peers.length === 1 ? '' : 's'} ahora.</p><p class="sm mut">Los equipos sin mánager los dirige la IA. El comisionado es ${esc(pname(S.adm))}.</p><table class="tbl"><tbody>${rows.map(t => `<tr><td>${teamLine(t.id, 22)}</td><td>${esc(pname(S.owners[t.id]))} ${t.id === S.me ? '<span class="pill acc">tú</span>' : ''}</td><td><span class="dot${online.has(S.owners[t.id]) || S.owners[t.id] === S.uid ? '' : ' off'}"></span></td><td class="n">${rec(t)}</td></tr>`).join('')}</tbody></table>
+  <p class="sm mut">${cur ? (cur.pub ? 'Liga pública · hasta 16 mánagers' : 'Liga privada · entra quien tenga el código') : ''}</p><p>${rows.length} mánager${rows.length === 1 ? '' : 'es'} humano${rows.length === 1 ? '' : 's'} · ${S.peers.length} conectado${S.peers.length === 1 ? '' : 's'} ahora.</p><p class="sm mut">Los equipos sin mánager los dirige la IA. El comisionado es ${esc(pname(S.adm))}.</p><table class="tbl"><tbody>${rows.map(t => `<tr><td>${teamLine(t.id, 22)}</td><td>${esc(pname(S.owners[t.id]))} ${t.id === S.me ? '<span class="pill acc">tú</span>' : ''}</td><td><span class="dot${online.has(S.owners[t.id]) || S.owners[t.id] === S.uid ? '' : ' off'}"></span></td><td class="n">${rec(t)}</td><td>${adm && S.owners[t.id] && S.owners[t.id] !== S.uid ? '<button class="btn sm dng" data-a="kick" data-uid="' + esc(S.owners[t.id]) + '">Expulsar</button>' : ''}</td></tr>`).join('')}</tbody></table>
   <div class="hr"></div><p class="sm"><b>Calendario:</b> los partidos y fases se juegan los ${esc(slotsTxt(m))}. ${cal}</p><p class="sm mut">La jornada se simula cuando alguien tiene la liga abierta a partir de esa hora (si estaba cerrada, se recupera al entrar).</p>
-  <div class="row" style="margin-top:.8rem">${S.me != null ? '<button class="btn dng" data-a="leaveteam">Dejar mi equipo</button>' : ''}<button class="btn" data-a="pickteam">Cambiar de equipo</button><button class="btn" data-a="leavelg">Salir de la liga</button></div>
+  <div class="row" style="margin-top:.8rem">${S.me != null ? '<button class="btn dng" data-a="leaveteam">Dejar mi equipo</button>' : ''}<button class="btn" data-a="pickteam">Cambiar de equipo</button><button class="btn" data-a="menu">Volver al menú</button><button class="btn dng" data-a="abandon">Abandonar liga</button></div>
   ${adm ? `<div class="hr"></div><div class="up xs mut">Comisionado</div><div class="row" style="margin-top:.4rem"><button class="btn" data-a="toggleauto">Avance automático: ${auto ? 'activado' : 'desactivado'}</button><button class="btn" data-a="forceadv" ${S.busy ? 'disabled' : ''}>Forzar jornada ahora</button></div>` : ''}</section>
   <section class="card"><h3>Chat de la liga</h3>${S.room ? `<div class="chat" id="chatlog">${S.chat.map(chatLine).join('') || '<span class="mut sm">Nadie ha escrito todavía.</span>'}</div><form class="row nw" id="chatform" style="margin-top:.5rem"><input type="text" id="chatin" class="grow" maxlength="300" placeholder="Escribe a los demás mánagers…" autocomplete="off"><button class="btn pri" style="font-size:.95rem" type="submit">Enviar</button></form>` : '<p class="mut">El chat en directo no está disponible en esta vista.</p>'}</section></div>`;
 }
@@ -2237,8 +2262,8 @@ function landing() {
   if (S.pick) {
     const W = S.pick.kind === 'join' ? S.W : S.tmpW; const k = S.pick.kind;
     return `<main style="max-width:1100px;margin:0 auto;padding:1rem 1rem 4rem"><div class="page-h"><h2>Elige tu franquicia</h2><button class="btn" data-a="pickback">Volver</button></div>
-    ${k !== 'join' && k !== 'solo' ? `<div class="row" style="margin-bottom:.6rem"><label for="lname" class="sm mut">Nombre de la liga</label><input type="text" id="lname" value="${esc(S.lname || 'Liga Gridiron')}" maxlength="40"><label for="ltime" class="sm mut">Hora de los partidos (lun · jue · sáb)</label><input type="time" id="ltime" value="${esc(S.ltime || '20:00')}"></div>` : k === 'solo' ? `<div class="row" style="margin-bottom:.6rem"><label for="lname" class="sm mut">Nombre de la liga</label><input type="text" id="lname" value="${esc(S.lname || 'Liga Gridiron')}" maxlength="40"></div>` : ''}
-    <p class="mut">Los 32 equipos son ficticios. El nivel indica la calidad actual de cada plantilla; empezar con un equipo débil es un reto distinto a heredar un candidato al título.</p>${S.busy ? '<p class="warn">Creando la liga…</p>' : teamPickGrid(W, k)}</main>`;
+    ${k === 'create' ? `<div class="row" style="margin-bottom:.6rem"><label for="lname" class="sm mut">Nombre de la liga</label><input type="text" id="lname" value="${esc(S.lname || 'Liga Gridiron')}" maxlength="40"><label for="ltime" class="sm mut">Hora de los partidos (lun · jue · sáb)</label><input type="time" id="ltime" value="${esc(S.ltime || '20:00')}"></div>` : k === 'solo' ? `<div class="row" style="margin-bottom:.6rem"><label for="lname" class="sm mut">Nombre de la liga</label><input type="text" id="lname" value="${esc(S.lname || 'Liga Gridiron')}" maxlength="40"></div>` : ''}
+    ${k === 'createpub' ? '<p class="sm mut">Vas a abrir una liga pública (hasta 16 mánagers). Los demás entran solos con «Jugar online» y los equipos sin mánager los dirige la IA. Partidos: lunes, jueves y sábado a las 20:00 (Europe/Madrid).</p>' : ''}<p class="mut">Los 32 equipos son ficticios. El nivel indica la calidad actual de cada plantilla; empezar con un equipo débil es un reto distinto a heredar un candidato al título.</p>${S.busy ? '<p class="warn">Creando la liga…</p>' : teamPickGrid(W, k)}</main>`;
   }
   const on = S.olReady && S.olInfo;
   const back = S.W && S.me != null ? '<div class="row" style="margin-bottom:.8rem"><button class="btn pri" data-a="resume">← Volver a mi partida</button></div>' : '';
@@ -2246,17 +2271,21 @@ function landing() {
   if (typeof supabase === 'undefined') onl = '<p class="warn sm">No se pudo cargar Supabase (¿sin conexión a internet?).</p>';
   else if (!fbConfigured()) onl = '<p class="mut sm">El modo online necesita tu proyecto de Supabase. Pega tu URL y tu clave anon en <code>SUPABASE_URL</code> y <code>SUPABASE_ANON_KEY</code> (primeras líneas del script) y publica el archivo. Mira el LEEME.</p>';
   else if (!S.authReady) onl = '<p class="mut sm">Conectando…</p>';
-  else if (!S.uid) onl = '<p class="warn sm">No se pudo iniciar sesión en Supabase. Activa «Allow anonymous sign-ins» en Authentication.</p>';
+  else if (!S.uid) onl = `<p class="sm">Para jugar online necesitas iniciar sesión con Google. Así tu equipo y tus ligas te siguen en cualquier dispositivo.</p>${urlLeague() ? '<p class="sm"><b>Te han invitado a la liga ' + esc(urlLeague().toUpperCase()) + '.</b> Inicia sesión y entrarás directamente.</p>' : ''}<div class="row" style="margin-top:.6rem"><button class="btn pri" data-a="glogin">Iniciar sesión con Google</button></div><p class="sm mut">El modo solitario no necesita cuenta.</p>`;
   else {
     const mine = (S.myLeagues || []).filter(l => l.id !== S.lid);
     const m = on ? S.olInfo.meta : null;
     onl = `<div class="row" style="margin-bottom:.5rem"><label for="pname" class="sm mut">Tu nombre</label><input type="text" id="pname" data-c="pname" value="${esc(S.myName || '')}" maxlength="24" placeholder="Nombre de mánager"></div>
-    <p class="sm mut" style="margin:.2rem 0 .6rem">${S.isAnon ? '<button class="btn sm" data-a="glogin">Iniciar sesión con Google</button> para conservar tus ligas si cambias de dispositivo.' : 'Sesión: ' + esc(S.email || 'Google') + ' <button class="btn sm" data-a="glogout">Cerrar sesión</button>'}</p>
-    ${on ? `<div class="hr"></div><p><b>${esc(S.olInfo.name)}</b> · temporada ${S.olInfo.season} · ${S.olInfo.humans} mánager${S.olInfo.humans === 1 ? '' : 'es'} · código <b>${esc(S.lid)}</b></p><p class="sm mut">Partidos: ${esc(slotsTxt(m))}.${m.auto !== false && m.nextAt ? ' Próximo: <b data-nm="' + m.nextAt + '">' + esc(nextWhen(m.nextAt)) + '</b>.' : ''}</p><div class="row"><button class="btn pri" data-a="enter">Entrar a la liga</button><button class="btn" data-a="leavelg">Salir</button></div>`
+    <p class="sm mut" style="margin:.2rem 0 .6rem">Sesión: ${esc(S.email || 'Google')} <button class="btn sm" data-a="glogout">Cerrar sesión</button></p>
+    ${on ? `<div class="hr"></div><p><b>${esc(S.olInfo.name)}</b> · temporada ${S.olInfo.season} · ${S.olInfo.humans} mánager${S.olInfo.humans === 1 ? '' : 'es'} · código <b>${esc(S.lid)}</b></p><p class="sm mut">Partidos: ${esc(slotsTxt(m))}.${m.auto !== false && m.nextAt ? ' Próximo: <b data-nm="' + m.nextAt + '">' + esc(nextWhen(m.nextAt)) + '</b>.' : ''}</p><div class="row"><button class="btn pri" data-a="enter">Entrar a la liga</button><button class="btn" data-a="leavelg">Desconectar</button></div>`
       : S.lid ? `<p class="mut sm">${S.sync === 'conectando' ? 'Cargando la liga ' + esc(S.lid) + '…' : 'La liga ' + esc(S.lid) + ' está vacía.'}</p>` : ''}
-    ${mine.length ? `<div class="hr"></div><div class="up xs mut">Tus ligas</div><div class="row" style="margin-top:.3rem">${mine.map(l => `<button class="btn sm" data-a="openleague" data-id="${esc(l.id)}">${esc(l.name)} · ${esc(l.id)}</button>`).join('')}</div>` : ''}
-    <div class="hr"></div><div class="row nw"><input type="text" id="jcode" class="grow" maxlength="8" placeholder="Código de liga" autocomplete="off" value="${esc(S.jcode || '')}"><button class="btn" data-a="joinleague">Unirme</button></div>
-    <div class="row" style="margin-top:.6rem"><button class="btn pri" data-a="newonline">Crear liga online</button></div><p class="sm mut">Comparte después el enlace con tus amigos: cada uno dirige un equipo. Los partidos se juegan solos los lunes, jueves y sábados.</p>`;
+    ${mine.length ? `<div class="hr"></div><div class="up xs mut">Tus ligas</div><div class="row" style="margin-top:.3rem">${mine.map(l => `<button class="btn sm" data-a="openleague" data-id="${esc(l.id)}">${l.pub ? '🌐' : '🔒'} ${esc(l.name)} · ${esc(l.id)}</button>`).join('')}</div>` : ''}
+    <div class="hr"></div><div class="up xs mut">Liga pública · con desconocidos</div>
+    <div class="row" style="margin-top:.3rem"><button class="btn pri" data-a="quickplay" ${S.busy ? 'disabled' : ''}>Jugar online</button></div>
+    <p class="sm mut">Entras directo a una liga pública con plazas libres (máximo 16 mánagers). Los equipos sin mánager los dirige la IA. Si todas están llenas, se abre una nueva.</p>
+    <div class="hr"></div><div class="up xs mut">Liga privada · con amigos</div>
+    <div class="row nw" style="margin-top:.3rem"><input type="text" id="jcode" class="grow" maxlength="8" placeholder="Código de liga" autocomplete="off" value="${esc(S.jcode || '')}"><button class="btn" data-a="joinleague">Unirme</button></div>
+    <div class="row" style="margin-top:.6rem"><button class="btn" data-a="newonline">Crear liga privada</button></div><p class="sm mut">Se crea con un código y un enlace para compartir: solo entra quien lo tenga. Los partidos se juegan solos los lunes, jueves y sábados.</p>`;
   }
   return `<main style="max-width:1100px;margin:0 auto;padding:1rem 1rem 4rem">${back}<section class="hero"><canvas id="hcv" aria-hidden="true"></canvas><div class="in"><div class="up xs" style="letter-spacing:.3em;opacity:.8">Simulador de dirección deportiva</div><h1>Gridiron<br>Dynasty</h1><p style="max-width:46ch;opacity:.9;margin:.6rem 0 0">Dirige una franquicia de fútbol americano durante décadas: plantilla, tope salarial, draft, táctica y partidos jugada a jugada en un estadio en 3D. Juega solo o en una liga online con otros mánagers.</p></div></section>
   <div class="grid g2" style="margin-top:1rem">
@@ -2298,14 +2327,40 @@ const H = {
   resume: () => { S.menu = false; render(); },
   continue: () => { const sv = loadSoloRaw(); if (!sv) return; try { S.W = GD.deserialize(sv.w); S.me = sv.me; S.mode = 'solo'; S.menu = false; S.view = 'home'; S.owners = {}; render(); } catch (e) { toast('No se pudo cargar la partida guardada.', 1); } },
   newsolo: () => { S.pick = { kind: 'solo' }; S.tmpW = GD.createWorld(String(Date.now())); render(); },
-  newonline: () => { S.pick = { kind: 'create' }; S.tmpW = GD.createWorld(String(Date.now())); render(); },
+  newonline: () => { S.lname = ''; S.pick = { kind: 'create' }; S.tmpW = GD.createWorld(String(Date.now())); render(); },
   enter: () => { S.menu = false; enterLeague(); if (S.me == null && S.canWrite) { S.pick = { kind: 'join' }; } render(); },
   pickback: () => { S.pick = null; render(); },
   pickteam: () => { S.pick = { kind: 'join' }; render(); },
   leaveteam: () => releaseTeam(),
-  openleague: async d => { S.menu = false; if (await connectLeague(d.id)) render(); },
-  joinleague: async () => { const v = ($('#jcode') || {}).value; S.jcode = ''; if (await connectLeague(v)) toast('Liga encontrada. Pulsa «Entrar a la liga».'); },
-  leavelg: () => { disconnect(); try { localStorage.removeItem('gd.lastLeague'); history.replaceState(null, '', location.href.split(/[?#]/)[0]); } catch (e) { } S.menu = true; render(); },
+  openleague: async d => { if (await connectLeague(d.id)) { await waitCache(8000); H.enter(); } },
+  joinleague: async () => { const v = ($('#jcode') || {}).value; S.jcode = ''; if (await connectLeague(v)) { await waitCache(8000); H.enter(); } },
+  leavelg: () => { disconnect(); try { history.replaceState(null, '', location.href.split(/[?#]/)[0]); } catch (e) { } S.menu = true; render(); },
+  quickplay: async () => {
+    if (!S.uid || S.busy) return; S.busy = true; render();
+    try {
+      const { data, error } = await SB.rpc('quick_play', { p_player: displayName() }); if (error) throw error;
+      S.busy = false;
+      if (data) { if (await connectLeague(data)) { await waitCache(8000); H.enter(); } else render(); }
+      else { S.lname = 'Liga pública ' + (100 + Math.floor(Math.random() * 900)); S.pick = { kind: 'createpub' }; S.tmpW = GD.createWorld(String(Date.now())); render(); }
+    } catch (e) { S.busy = false; toast('No se pudo entrar: ' + errMsg(e), 1); render(); }
+  },
+  abandon: async () => {
+    if (!S.lid || !window.confirm('¿Abandonar esta liga? Perderás tu equipo y tendrás que volver a entrar con el código (o con «Jugar online» si es pública).')) return;
+    const lid = S.lid;
+    try {
+      if (S.me != null) await releaseTeam();
+      const { error } = await SB.rpc('leave_league', { p_id: lid }); if (error) throw error;
+      disconnect(); try { if (localStorage.getItem('gd.lastLeague') === lid) localStorage.removeItem('gd.lastLeague'); history.replaceState(null, '', location.href.split(/[?#]/)[0]); } catch (e) { }
+      await refreshMyLeagues(); S.menu = true; toast('Has abandonado la liga.');
+    } catch (e) { toast('No se pudo abandonar: ' + errMsg(e), 1); }
+    render();
+  },
+  kick: async d => {
+    const uid = d.uid; if (!isAdm() || !uid || uid === S.uid) return;
+    if (!window.confirm('¿Expulsar a ' + pname(uid) + ' de la liga? No podrá volver a entrar.')) return;
+    try { await removeOwners([uid]); const { error } = await SB.rpc('kick_member', { p_league: S.lid, p_uid: uid }); if (error) throw error; toast('Mánager expulsado.'); }
+    catch (e) { toast('No se pudo expulsar: ' + errMsg(e), 1); }
+  },
   copylink: async () => { const l = inviteLink(); try { await navigator.clipboard.writeText(l); toast('Enlace copiado.'); } catch (e) { window.prompt('Copia este enlace:', l); } },
   forceadv: () => { if (window.confirm('¿Jugar ahora la siguiente jornada sin esperar al calendario (lun/jue/sáb)?')) advanceLeague(); },
   toggleauto: async () => {
@@ -2314,18 +2369,22 @@ const H = {
   },
   glogin: async () => {
     try {
-      const redirectTo = location.href.split(/[?#]/)[0] + (S.lid ? '?liga=' + S.lid : '');
-      const r = S.isAnon ? await SB.auth.linkIdentity({ provider: 'google', options: { redirectTo } }) : await SB.auth.signInWithOAuth({ provider: 'google', options: { redirectTo } });
+      const q = urlLeague() || S.lid || '';
+      const redirectTo = location.href.split(/[?#]/)[0] + (q ? '?liga=' + q : '');
+      const r = await SB.auth.signInWithOAuth({ provider: 'google', options: { redirectTo } });
       if (r.error) throw r.error;
     } catch (e) { toast('No se pudo iniciar sesión con Google: ' + (e.message || e.code), 1); }
   },
-  glogout: async () => { try { disconnect(); await SB.auth.signOut(); await SB.auth.signInAnonymously(); await applyUser(); await loadProfile(); toast('Sesión cerrada.'); } catch (e) { toast('No se pudo cerrar sesión.', 1); } render(); },
+  glogout: async () => {
+    try { disconnect(); await SB.auth.signOut(); await applyUser(); S.myLeagues = []; S.myName = ''; try { localStorage.removeItem('gd.lastLeague'); localStorage.removeItem('gd.name'); } catch (e) { } toast('Sesión cerrada.'); } catch (e) { toast('No se pudo cerrar sesión.', 1); }
+    S.menu = true; render();
+  },
   pickt: async d => {
     const id = +d.id, k = S.pick.kind; const li = $('#lname'); if (li) S.lname = li.value.trim() || 'Liga Gridiron'; const lt = $('#ltime'); if (lt && lt.value) S.ltime = lt.value;
     if (k === 'join') { await claimTeam(id); return; }
     const W = S.tmpW; W.meta.name = S.lname || 'Liga Gridiron';
     if (k === 'solo') { S.W = W; S.me = id; S.mode = 'solo'; S.owners = {}; S.pick = null; S.menu = false; S.view = 'home'; saveSolo(); render(); }
-    else { await createOnline(W, id); }
+    else { await createOnline(W, id, k === 'createpub'); }
   },
   tradewith: d => { S.view = 'trades'; S.f.tw = +d.id; S.f.give = []; S.f.get = []; render(); }
 };
@@ -2357,12 +2416,13 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') { if (MATCH)
   render();
   if (!fbConfigured()) { S.sync = 'sin configurar'; S.authReady = true; render(); return; }
   try {
-    sbInit(); await authInit(); await loadProfile();
-    let last = ''; try { last = localStorage.getItem('gd.lastLeague') || ''; } catch (e) { }
-    const q = urlLeague() || last;
+    sbInit(); await authInit();
+    if (S.uid) { await loadProfile(); SB.rpc('purge_dead_leagues').then(() => { }, () => { }); }
+    const fromUrl = urlLeague(); let last = ''; try { last = localStorage.getItem('gd.lastLeague') || ''; } catch (e) { }
+    if (last && !(S.myLeagues || []).some(l => l.id === last)) last = '';
     S.authReady = true; render();
-    if (q) await connectLeague(q, !urlLeague());
-  } catch (e) { console.error(e); S.sync = 'error'; toast(/anonymous/i.test(e.message || '') ? 'Activa «Allow anonymous sign-ins» en Supabase (Authentication).' : 'Error de Supabase: ' + (e.message || e.code), 1); }
+    if (S.uid) { const q = fromUrl || last; if (q) { const ok = await connectLeague(q, !fromUrl); if (ok && fromUrl) { await waitCache(8000); H.enter(); } } }
+  } catch (e) { console.error(e); S.sync = 'error'; toast('Error de Supabase: ' + errMsg(e), 1); }
   S.authReady = true; render();
   setInterval(() => { calcPeers(); updateCountdowns(); autoAdvance(); }, 15000);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) { touchMember(); if (S.db) loadLg(false).catch(() => { }); autoAdvance(); } });
